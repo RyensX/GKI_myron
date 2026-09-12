@@ -1,0 +1,224 @@
+name: Build myron Droidspaces-only GKI
+
+on:
+  workflow_dispatch:
+    inputs:
+      use_cache:
+        description: "Restore/save Bazel cache"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: myron-droidspaces-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Stock target: 6.12.69-android16-6, 4 KiB pages.
+  COMMON_TAG: android16-6.12-2026-03_r62
+  COMMON_COMMIT: e2b8ca7c8d0551a6124b1a7322f5ae532845f1b5
+
+jobs:
+  build:
+    name: 6.12.69-android16-6 Droidspaces-only (4K)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout build scripts
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: endersonmenezes/free-disk-space@v3
+        with:
+          remove_android: true
+          remove_dotnet: true
+          remove_haskell: true
+          remove_tool_cache: true
+          remove_swap: true
+          remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* temurin-* *llvm* mysql* dotnet-sdk-*"
+          remove_packages_one_command: true
+          remove_folders: "/usr/share/swift /usr/share/miniconda /usr/share/az* /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell /usr/local/julia /usr/local/aws-cli /usr/local/aws-sam-cli /usr/share/gradle"
+
+      - name: Add swap for ThinLTO
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 16
+
+      - name: Install repo and prepare directories
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/kernel" "$GITHUB_WORKSPACE/git-repo"
+          curl --fail --location --retry 5 \
+            https://storage.googleapis.com/git-repo-downloads/repo \
+            --output "$GITHUB_WORKSPACE/git-repo/repo"
+          chmod +x "$GITHUB_WORKSPACE/git-repo/repo"
+          echo "$GITHUB_WORKSPACE/git-repo" >> "$GITHUB_PATH"
+
+      - name: Sync Android 16 6.12 source
+        working-directory: kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo init \
+            -u https://android.googlesource.com/kernel/manifest \
+            -b common-android16-6.12-2026-03 \
+            --depth=1
+          repo sync -c --current-branch --no-clone-bundle --no-tags -j4
+
+      - name: Pin kernel/common to the stock-corresponding release
+        working-directory: kernel/common
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --depth=1 origin "refs/tags/${COMMON_TAG}"
+          git checkout --detach FETCH_HEAD
+          actual="$(git rev-parse HEAD)"
+          if [ "$actual" != "$COMMON_COMMIT" ]; then
+            echo "Unexpected ${COMMON_TAG} commit: $actual" >&2
+            exit 1
+          fi
+          echo "Pinned kernel/common: ${COMMON_TAG} (${actual})"
+
+      - name: Resolve and apply Droidspaces 6.12 patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://github.com/ravindu644/Droidspaces-OSS.git
+          ds_commit="$(git -C Droidspaces-OSS rev-parse HEAD)"
+          echo "DROIDSPACES_COMMIT=${ds_commit}" >> "$GITHUB_ENV"
+
+          patch_file="$GITHUB_WORKSPACE/Droidspaces-OSS/Documentation/resources/kernel-patches/GKI/kernel-6.12/001.GKI-6.12-or-above-fix_sysvipc_kabi.patch"
+          test -f "$patch_file"
+          patch --directory="$GITHUB_WORKSPACE/kernel/common" -p1 < "$patch_file"
+
+          # Keep parity with Droidspaces' maintained Android 16/6.12 action.
+          # These symbols are required by its IPC namespace integration.
+          grep -q 'EXPORT_SYMBOL_GPL(put_ipc_ns);' \
+            "$GITHUB_WORKSPACE/kernel/common/ipc/namespace.c" || \
+            echo 'EXPORT_SYMBOL_GPL(put_ipc_ns);' >> \
+              "$GITHUB_WORKSPACE/kernel/common/ipc/namespace.c"
+          grep -q 'EXPORT_SYMBOL_GPL(init_ipc_ns);' \
+            "$GITHUB_WORKSPACE/kernel/common/ipc/msgutil.c" || \
+            echo 'EXPORT_SYMBOL_GPL(init_ipc_ns);' >> \
+              "$GITHUB_WORKSPACE/kernel/common/ipc/msgutil.c"
+
+      - name: Enable only Droidspaces-required kernel options
+        working-directory: kernel/common
+        shell: bash
+        run: |
+          set -euo pipefail
+          defconfig="arch/arm64/configs/gki_defconfig"
+
+          set_config() {
+            key="$1"
+            value="$2"
+            if grep -q "^${key}=" "$defconfig"; then
+              sed -i "s|^${key}=.*|${key}=${value}|" "$defconfig"
+            elif grep -q "^# ${key} is not set" "$defconfig"; then
+              sed -i "s|^# ${key} is not set|${key}=${value}|" "$defconfig"
+            else
+              printf '%s=%s\n' "$key" "$value" >> "$defconfig"
+            fi
+          }
+
+          set_config CONFIG_PID_NS y
+          set_config CONFIG_IPC_NS y
+          set_config CONFIG_SYSVIPC y
+          set_config CONFIG_POSIX_MQUEUE y
+          set_config CONFIG_DEVTMPFS y
+          set_config CONFIG_USER_NS y
+          set_config CONFIG_BINFMT_MISC y
+          set_config CONFIG_BINFMT_SCRIPT y
+          set_config CONFIG_BINFMT_ELF y
+          set_config CONFIG_OVERLAY_FS y
+          set_config CONFIG_TMPFS_XATTR y
+          set_config CONFIG_TMPFS_POSIX_ACL y
+
+          # These checks also ensure no KernelSU/SUSFS option was added accidentally.
+          for key in CONFIG_PID_NS CONFIG_IPC_NS CONFIG_SYSVIPC \
+                     CONFIG_POSIX_MQUEUE CONFIG_DEVTMPFS CONFIG_USER_NS; do
+            grep -qx "${key}=y" "$defconfig"
+          done
+          if grep -Eq '^CONFIG_KSU(_[A-Z0-9_]+)?=' "$defconfig"; then
+            echo "Unexpected built-in KernelSU/SUSFS configuration" >&2
+            exit 1
+          fi
+
+      - name: Configure Bazel cache
+        if: inputs.use_cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/bazel
+          key: myron-gki-${{ env.COMMON_TAG }}-${{ hashFiles('.github/workflows/myron-droidspaces-only.yml') }}
+          restore-keys: |
+            myron-gki-${{ env.COMMON_TAG }}-
+
+      - name: Build 4K arm64 Image
+        working-directory: kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Do not rewrite scripts/setlocalversion: preserving the Android KMI
+          # release string is important for the existing vendor and KSU LKM modules.
+          sed -i '/name = "kernel_aarch64",/a\    check_defconfig = "disabled",' common/BUILD.bazel
+
+          cache_args=()
+          if [ "${{ inputs.use_cache }}" = "true" ]; then
+            cache_args+=(--disk_cache="$HOME/.cache/bazel")
+          fi
+          tools/bazel build --config=fast "${cache_args[@]}" \
+            //common:kernel_aarch64/Image
+
+      - name: Verify output and prepare package
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="$GITHUB_WORKSPACE/kernel/bazel-bin/common/kernel_aarch64/Image"
+          test -s "$image"
+
+          version="$(strings "$image" | grep -m1 '^Linux version ' || true)"
+          echo "$version"
+          if ! grep -q '6\.12\.69-android16-6' <<< "$version"; then
+            echo "Built Image does not report the expected KMI generation" >&2
+            exit 1
+          fi
+
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp "$image" "$GITHUB_WORKSPACE/out/Image"
+          cp "$GITHUB_WORKSPACE/kernel/common/arch/arm64/configs/gki_defconfig" \
+            "$GITHUB_WORKSPACE/out/gki_defconfig"
+          sha256sum "$GITHUB_WORKSPACE/out/Image" \
+            "$GITHUB_WORKSPACE/out/gki_defconfig" > "$GITHUB_WORKSPACE/out/SHA256SUMS"
+          {
+            echo "common_tag=${COMMON_TAG}"
+            echo "common_commit=${COMMON_COMMIT}"
+            echo "droidspaces_commit=${DROIDSPACES_COMMIT}"
+            echo "target=myron (Redmi K90 Pro Max / POCO F8 Ultra)"
+            echo "page_size=4K"
+            echo "root=external KernelSU LKM; no built-in KSU"
+          } > "$GITHUB_WORKSPACE/out/BUILD-INFO.txt"
+
+      - name: Build AnyKernel3 package
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth=1 --branch gki-2.0 \
+            https://github.com/WildKernels/AnyKernel3.git AnyKernel3
+          rm -rf AnyKernel3/.git AnyKernel3/.github
+          cp out/Image AnyKernel3/Image
+          cp out/BUILD-INFO.txt out/SHA256SUMS AnyKernel3/
+          (cd AnyKernel3 && zip -r9 ../out/myron-droidspaces-6.12.69-android16-6-4k-AnyKernel3.zip .)
+          sha256sum out/myron-droidspaces-6.12.69-android16-6-4k-AnyKernel3.zip \
+            >> out/SHA256SUMS
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: myron-droidspaces-6.12.69-android16-6-4k
+          path: out/
+          if-no-files-found: error
+          compression-level: 9
