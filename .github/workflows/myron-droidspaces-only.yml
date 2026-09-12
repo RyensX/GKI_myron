@@ -83,8 +83,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git fetch --depth=1 origin "refs/tags/${COMMON_TAG}"
-          git checkout --detach FETCH_HEAD
+          # repo sync 已按 locked.xml 同步固定提交；远程名由 manifest 定义为 aosp。
+          # 直接验证实际 HEAD，避免重复拉取或改变已记录的源码状态。
           actual="$(git rev-parse HEAD)"
           if [ "$actual" != "$COMMON_COMMIT" ]; then
             echo "Unexpected ${COMMON_TAG} commit: $actual" >&2
