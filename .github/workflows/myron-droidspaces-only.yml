@@ -19,6 +19,8 @@ env:
   # Stock target: 6.12.69-android16-6, 4 KiB pages.
   COMMON_TAG: android16-6.12-2026-03_r62
   COMMON_COMMIT: e2b8ca7c8d0551a6124b1a7322f5ae532845f1b5
+  DROIDSPACES_COMMIT: 2280b592f43312254dc3c976fc01558aa1186d51
+  ANYKERNEL_COMMIT: e1e9dce98430c5c6f231f7094a8c7f4ecaf50948
 
 jobs:
   build:
@@ -67,9 +69,13 @@ jobs:
             -u https://android.googlesource.com/kernel/manifest \
             -b common-android16-6.12-2026-03 \
             --depth=1
+          cp "$GITHUB_WORKSPACE/myron/locked.xml" .repo/manifests/myron-locked.xml
+          repo init -m myron-locked.xml
           repo sync -c --current-branch --no-clone-bundle --no-tags -j4
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          repo manifest -r -o "$GITHUB_WORKSPACE/out/manifest.xml"
 
-      - name: Pin kernel/common to the stock-corresponding release
+      - name: Verify candidate kernel/common release
         working-directory: kernel/common
         shell: bash
         run: |
@@ -87,9 +93,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git clone --depth=1 https://github.com/ravindu644/Droidspaces-OSS.git
+          git init Droidspaces-OSS
+          git -C Droidspaces-OSS remote add origin https://github.com/ravindu644/Droidspaces-OSS.git
+          git -C Droidspaces-OSS fetch --depth=1 origin "$DROIDSPACES_COMMIT"
+          git -C Droidspaces-OSS checkout --detach FETCH_HEAD
           ds_commit="$(git -C Droidspaces-OSS rev-parse HEAD)"
-          echo "DROIDSPACES_COMMIT=${ds_commit}" >> "$GITHUB_ENV"
+          test "$ds_commit" = "$DROIDSPACES_COMMIT"
 
           patch_file="$GITHUB_WORKSPACE/Droidspaces-OSS/Documentation/resources/kernel-patches/GKI/kernel-6.12/001.GKI-6.12-or-above-fix_sysvipc_kabi.patch"
           test -f "$patch_file"
@@ -137,6 +146,8 @@ jobs:
           set_config CONFIG_OVERLAY_FS y
           set_config CONFIG_TMPFS_XATTR y
           set_config CONFIG_TMPFS_POSIX_ACL y
+          set_config CONFIG_IKCONFIG y
+          set_config CONFIG_IKCONFIG_PROC y
 
           # These checks also ensure no KernelSU/SUSFS option was added accidentally.
           for key in CONFIG_PID_NS CONFIG_IPC_NS CONFIG_SYSVIPC \
@@ -182,21 +193,24 @@ jobs:
 
           version="$(strings "$image" | grep -m1 '^Linux version ' || true)"
           echo "$version"
-          if ! grep -q '6\.12\.69-android16-6' <<< "$version"; then
+          if ! grep -Eq '^Linux version 6\.12\.69-android16-6(-| )' <<< "$version"; then
             echo "Built Image does not report the expected KMI generation" >&2
             exit 1
           fi
 
           mkdir -p "$GITHUB_WORKSPACE/out"
           cp "$image" "$GITHUB_WORKSPACE/out/Image"
+          bash kernel/common/scripts/extract-ikconfig "$image" > out/kernel.config
+          bash myron/verify-config.sh out/kernel.config
           cp "$GITHUB_WORKSPACE/kernel/common/arch/arm64/configs/gki_defconfig" \
             "$GITHUB_WORKSPACE/out/gki_defconfig"
-          sha256sum "$GITHUB_WORKSPACE/out/Image" \
-            "$GITHUB_WORKSPACE/out/gki_defconfig" > "$GITHUB_WORKSPACE/out/SHA256SUMS"
           {
             echo "common_tag=${COMMON_TAG}"
             echo "common_commit=${COMMON_COMMIT}"
             echo "droidspaces_commit=${DROIDSPACES_COMMIT}"
+            echo "anykernel_commit=${ANYKERNEL_COMMIT}"
+            echo "baseline_status=candidate; OEM commit b1493ec68d4a not matched"
+            echo "device_boot_test=not performed"
             echo "target=myron (Redmi K90 Pro Max / POCO F8 Ultra)"
             echo "page_size=4K"
             echo "root=external KernelSU LKM; no built-in KSU"
@@ -206,14 +220,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git clone --depth=1 --branch gki-2.0 \
-            https://github.com/WildKernels/AnyKernel3.git AnyKernel3
+          git init AnyKernel3
+          git -C AnyKernel3 remote add origin https://github.com/WildKernels/AnyKernel3.git
+          git -C AnyKernel3 fetch --depth=1 origin "$ANYKERNEL_COMMIT"
+          git -C AnyKernel3 checkout --detach FETCH_HEAD
+          test "$(git -C AnyKernel3 rev-parse HEAD)" = "$ANYKERNEL_COMMIT"
           rm -rf AnyKernel3/.git AnyKernel3/.github
           cp out/Image AnyKernel3/Image
-          cp out/BUILD-INFO.txt out/SHA256SUMS AnyKernel3/
+          cp out/BUILD-INFO.txt out/kernel.config AnyKernel3/
+          cp myron/check-device.sh AnyKernel3/
+          python3 myron/guard-installer.py AnyKernel3/anykernel.sh
+          (cd AnyKernel3 && sha256sum Image kernel.config BUILD-INFO.txt anykernel.sh check-device.sh > SHA256SUMS)
           (cd AnyKernel3 && zip -r9 ../out/myron-droidspaces-6.12.69-android16-6-4k-AnyKernel3.zip .)
-          sha256sum out/myron-droidspaces-6.12.69-android16-6-4k-AnyKernel3.zip \
-            >> out/SHA256SUMS
+          (cd out && sha256sum Image kernel.config gki_defconfig manifest.xml BUILD-INFO.txt *.zip > SHA256SUMS && sha256sum -c SHA256SUMS)
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
