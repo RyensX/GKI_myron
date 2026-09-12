@@ -32,6 +32,9 @@ jobs:
       - name: Checkout build scripts
         uses: actions/checkout@v4
 
+      - name: Test installer and configuration guards
+        run: python3 myron/test_guards.py
+
       - name: Free disk space
         uses: endersonmenezes/free-disk-space@v3
         with:
@@ -230,7 +233,7 @@ jobs:
           cp out/BUILD-INFO.txt out/kernel.config AnyKernel3/
           cp myron/check-device.sh AnyKernel3/
           python3 myron/guard-installer.py AnyKernel3/anykernel.sh
-          (cd AnyKernel3 && sha256sum Image kernel.config BUILD-INFO.txt anykernel.sh check-device.sh > SHA256SUMS)
+          (cd AnyKernel3 && sha256sum Image kernel.config BUILD-INFO.txt anykernel.sh check-device.sh META-INF/com/google/android/update-binary > SHA256SUMS && sha256sum -c SHA256SUMS)
           (cd AnyKernel3 && zip -r9 ../out/myron-droidspaces-6.12.69-android16-6-4k-AnyKernel3.zip .)
           (cd out && sha256sum Image kernel.config gki_defconfig manifest.xml BUILD-INFO.txt *.zip > SHA256SUMS && sha256sum -c SHA256SUMS)
 
