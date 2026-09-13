@@ -1,4 +1,4 @@
-name: Build myron Droidspaces-only GKI
+name: Build myron baseline GKI
 
 on:
   workflow_dispatch:
@@ -12,19 +12,18 @@ permissions:
   contents: read
 
 concurrency:
-  group: myron-droidspaces-${{ github.ref }}
+  group: myron-baseline-${{ github.ref }}
   cancel-in-progress: false
 
 env:
   # Stock target: 6.12.69-android16-6, 4 KiB pages.
   COMMON_TAG: android16-6.12-2026-03_r62
   COMMON_COMMIT: e2b8ca7c8d0551a6124b1a7322f5ae532845f1b5
-  DROIDSPACES_COMMIT: 2280b592f43312254dc3c976fc01558aa1186d51
   ANYKERNEL_COMMIT: e1e9dce98430c5c6f231f7094a8c7f4ecaf50948
 
 jobs:
   build:
-    name: 6.12.69-android16-6 Droidspaces-only (4K)
+    name: 6.12.69-android16-6 Baseline without Droidspaces (4K)
     runs-on: ubuntu-24.04
     timeout-minutes: 120
 
@@ -92,90 +91,22 @@ jobs:
           fi
           echo "Pinned kernel/common: ${COMMON_TAG} (${actual})"
 
-      - name: Resolve and apply Droidspaces 6.12 patch
-        shell: bash
-        run: |
-          set -euo pipefail
-          git init Droidspaces-OSS
-          git -C Droidspaces-OSS remote add origin https://github.com/ravindu644/Droidspaces-OSS.git
-          git -C Droidspaces-OSS fetch --depth=1 origin "$DROIDSPACES_COMMIT"
-          git -C Droidspaces-OSS checkout --detach FETCH_HEAD
-          ds_commit="$(git -C Droidspaces-OSS rev-parse HEAD)"
-          test "$ds_commit" = "$DROIDSPACES_COMMIT"
-
-          patch_file="$GITHUB_WORKSPACE/Droidspaces-OSS/Documentation/resources/kernel-patches/GKI/kernel-6.12/001.GKI-6.12-or-above-fix_sysvipc_kabi.patch"
-          test -f "$patch_file"
-          patch --directory="$GITHUB_WORKSPACE/kernel/common" -p1 < "$patch_file"
-
-          # Keep parity with Droidspaces' maintained Android 16/6.12 action.
-          # These symbols are required by its IPC namespace integration.
-          grep -q 'EXPORT_SYMBOL_GPL(put_ipc_ns);' \
-            "$GITHUB_WORKSPACE/kernel/common/ipc/namespace.c" || \
-            echo 'EXPORT_SYMBOL_GPL(put_ipc_ns);' >> \
-              "$GITHUB_WORKSPACE/kernel/common/ipc/namespace.c"
-          grep -q 'EXPORT_SYMBOL_GPL(init_ipc_ns);' \
-            "$GITHUB_WORKSPACE/kernel/common/ipc/msgutil.c" || \
-            echo 'EXPORT_SYMBOL_GPL(init_ipc_ns);' >> \
-              "$GITHUB_WORKSPACE/kernel/common/ipc/msgutil.c"
-
-      - name: Enable only Droidspaces-required kernel options
-        working-directory: kernel/common
-        shell: bash
-        run: |
-          set -euo pipefail
-          defconfig="arch/arm64/configs/gki_defconfig"
-
-          set_config() {
-            key="$1"
-            value="$2"
-            if grep -q "^${key}=" "$defconfig"; then
-              sed -i "s|^${key}=.*|${key}=${value}|" "$defconfig"
-            elif grep -q "^# ${key} is not set" "$defconfig"; then
-              sed -i "s|^# ${key} is not set|${key}=${value}|" "$defconfig"
-            else
-              printf '%s=%s\n' "$key" "$value" >> "$defconfig"
-            fi
-          }
-
-          set_config CONFIG_PID_NS y
-          set_config CONFIG_IPC_NS y
-          set_config CONFIG_SYSVIPC y
-          set_config CONFIG_POSIX_MQUEUE y
-          set_config CONFIG_DEVTMPFS y
-          set_config CONFIG_USER_NS y
-          set_config CONFIG_BINFMT_MISC y
-          set_config CONFIG_BINFMT_SCRIPT y
-          set_config CONFIG_BINFMT_ELF y
-          set_config CONFIG_OVERLAY_FS y
-          set_config CONFIG_TMPFS_XATTR y
-          set_config CONFIG_TMPFS_POSIX_ACL y
-          set_config CONFIG_IKCONFIG y
-          set_config CONFIG_IKCONFIG_PROC y
-
-          # These checks also ensure no KernelSU/SUSFS option was added accidentally.
-          for key in CONFIG_PID_NS CONFIG_IPC_NS CONFIG_SYSVIPC \
-                     CONFIG_POSIX_MQUEUE CONFIG_DEVTMPFS CONFIG_USER_NS; do
-            grep -qx "${key}=y" "$defconfig"
-          done
-          if grep -Eq '^CONFIG_KSU(_[A-Z0-9_]+)?=' "$defconfig"; then
-            echo "Unexpected built-in KernelSU/SUSFS configuration" >&2
-            exit 1
-          fi
-
       - name: Configure Bazel cache
         if: inputs.use_cache
         uses: actions/cache@v4
         with:
           path: ~/.cache/bazel
-          key: myron-gki-${{ env.COMMON_TAG }}-${{ hashFiles('.github/workflows/myron-droidspaces-only.yml') }}
+          key: myron-baseline-gki-${{ env.COMMON_TAG }}-${{ hashFiles('.github/workflows/myron-droidspaces-only.yml', 'myron/locked.xml') }}
           restore-keys: |
-            myron-gki-${{ env.COMMON_TAG }}-
+            myron-baseline-gki-${{ env.COMMON_TAG }}-
 
       - name: Build 4K arm64 Image
         working-directory: kernel
         shell: bash
         run: |
           set -euo pipefail
+          # 对照实验要求编译前源码、defconfig 均未被修改。
+          git -C common diff --exit-code HEAD
           # Do not rewrite scripts/setlocalversion: preserving the Android KMI
           # release string is important for the existing vendor and KSU LKM modules.
           sed -i '/name = "kernel_aarch64",/a\    check_defconfig = "disabled",' common/BUILD.bazel
@@ -204,13 +135,13 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/out"
           cp "$image" "$GITHUB_WORKSPACE/out/Image"
           bash kernel/common/scripts/extract-ikconfig "$image" > out/kernel.config
-          bash myron/verify-config.sh out/kernel.config
+          bash myron/verify-baseline-config.sh out/kernel.config
           cp "$GITHUB_WORKSPACE/kernel/common/arch/arm64/configs/gki_defconfig" \
             "$GITHUB_WORKSPACE/out/gki_defconfig"
           {
             echo "common_tag=${COMMON_TAG}"
             echo "common_commit=${COMMON_COMMIT}"
-            echo "droidspaces_commit=${DROIDSPACES_COMMIT}"
+            echo "droidspaces=disabled; no patches or config changes"
             echo "anykernel_commit=${ANYKERNEL_COMMIT}"
             echo "baseline_status=candidate; OEM commit b1493ec68d4a not matched"
             echo "device_boot_test=not performed"
@@ -234,13 +165,13 @@ jobs:
           cp myron/check-device.sh AnyKernel3/
           python3 myron/guard-installer.py AnyKernel3/anykernel.sh
           (cd AnyKernel3 && sha256sum Image kernel.config BUILD-INFO.txt anykernel.sh check-device.sh META-INF/com/google/android/update-binary > SHA256SUMS && sha256sum -c SHA256SUMS)
-          (cd AnyKernel3 && zip -r9 ../out/myron-droidspaces-6.12.69-android16-6-4k-AnyKernel3.zip .)
+          (cd AnyKernel3 && zip -r9 ../out/myron-baseline-6.12.69-android16-6-4k-AnyKernel3.zip .)
           (cd out && sha256sum Image kernel.config gki_defconfig manifest.xml BUILD-INFO.txt *.zip > SHA256SUMS && sha256sum -c SHA256SUMS)
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: myron-droidspaces-6.12.69-android16-6-4k
+          name: myron-baseline-6.12.69-android16-6-4k
           path: out/
           if-no-files-found: error
           compression-level: 9
